@@ -1,0 +1,11 @@
+profiles:
+  waveshare_esp32c6:
+    notes: Waveshare ESP32-C6-Touch-LCD-1.69 (SKU 31538)
+    fqbn: esp32:esp32:esp32c6:CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB
+    platforms:
+      - platform: esp32:esp32 (3.2.0)
+        platform_index_url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    libraries:
+      - GFX Library for Arduino (1.6.0)
+
+default_profile: waveshare_esp32c6

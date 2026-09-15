@@ -1,0 +1,8 @@
+# Arduino CLI downloads and isolated build-profile cache
+.arduino-cli/
+
+# Local, repo-scoped tool downloads
+.tools/
+
+# Optional explicit build output
+build/
