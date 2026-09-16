@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <esp_err.h>
 #include <lwip/sockets.h>
+#include <math.h>
 
 #include "audio_chirp.h"
 #include "es8311.h"
@@ -30,6 +31,13 @@ constexpr int I2S_DIN = 21;
 constexpr int AUDIO_MCLK_MULTIPLE = 256;
 constexpr int AUDIO_CODEC_VOLUME = 75;
 constexpr size_t AUDIO_CHUNK_SAMPLES = 256;
+constexpr uint32_t MIC_TEST_DURATION_MS = 2400;
+constexpr uint32_t MIC_REPORT_INTERVAL_MS = 200;
+constexpr size_t MIC_READ_SAMPLES = 240;
+constexpr size_t MIC_TEST_SAMPLES =
+    CHIRP_SAMPLE_RATE * MIC_TEST_DURATION_MS / 1000;
+constexpr size_t MIC_REPORT_SAMPLES =
+    CHIRP_SAMPLE_RATE * MIC_REPORT_INTERVAL_MS / 1000;
 
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(
@@ -41,7 +49,9 @@ TouchDrvCSTXXX touch;
 volatile bool isPressed = false;
 I2SClass i2s;
 SemaphoreHandle_t beepSemaphore = nullptr;
+SemaphoreHandle_t micSemaphore = nullptr;
 bool audioReady = false;
+bool micReady = false;
 bool wifiStarted = false;
 bool wifiConnected = false;
 
@@ -100,6 +110,79 @@ void audioTask(void *arg) {
                     static_cast<unsigned>(silenceBytesWritten),
                     static_cast<unsigned>(sizeof(silence)), i2s.lastError());
     }
+  }
+}
+
+void micTask(void *arg) {
+  static int16_t samples[MIC_READ_SAMPLES];
+
+  while (true) {
+    xSemaphoreTake(micSemaphore, portMAX_DELAY);
+
+    Serial.printf("mic start: duration=%lu ms sample_rate=%lu Hz\n",
+                  static_cast<unsigned long>(MIC_TEST_DURATION_MS),
+                  static_cast<unsigned long>(CHIRP_SAMPLE_RATE));
+
+    size_t totalSamples = 0;
+    uint64_t totalSquares = 0;
+    uint32_t totalPeak = 0;
+    size_t reportSamples = 0;
+    uint64_t reportSquares = 0;
+    uint32_t reportPeak = 0;
+
+    while (totalSamples < MIC_TEST_SAMPLES) {
+      const size_t samplesRequested =
+          min(MIC_READ_SAMPLES, MIC_TEST_SAMPLES - totalSamples);
+      const size_t bytesRequested = samplesRequested * sizeof(samples[0]);
+      const size_t bytesRead =
+          i2s.readBytes(reinterpret_cast<char *>(samples), bytesRequested);
+      const size_t samplesRead = bytesRead / sizeof(samples[0]);
+
+      for (size_t i = 0; i < samplesRead; ++i) {
+        const int32_t sample = samples[i];
+        const uint32_t magnitude =
+            sample < 0 ? static_cast<uint32_t>(-sample)
+                       : static_cast<uint32_t>(sample);
+        const uint64_t square =
+            static_cast<uint64_t>(static_cast<int64_t>(sample) * sample);
+
+        totalSquares += square;
+        reportSquares += square;
+        totalPeak = max(totalPeak, magnitude);
+        reportPeak = max(reportPeak, magnitude);
+        ++totalSamples;
+        ++reportSamples;
+
+        if (reportSamples == MIC_REPORT_SAMPLES) {
+          const double rms =
+              sqrt(static_cast<double>(reportSquares) / reportSamples);
+          const uint32_t elapsedMs =
+              totalSamples * 1000UL / CHIRP_SAMPLE_RATE;
+          Serial.printf("mic %lu ms: samples=%u rms=%.1f peak=%lu\n",
+                        static_cast<unsigned long>(elapsedMs),
+                        static_cast<unsigned>(reportSamples), rms,
+                        static_cast<unsigned long>(reportPeak));
+          reportSamples = 0;
+          reportSquares = 0;
+          reportPeak = 0;
+        }
+      }
+
+      if (bytesRead != bytesRequested) {
+        Serial.printf("mic: I2S.readBytes failed: %u/%u bytes, error=%d\n",
+                      static_cast<unsigned>(bytesRead),
+                      static_cast<unsigned>(bytesRequested), i2s.lastError());
+        break;
+      }
+    }
+
+    const double totalRms =
+        totalSamples > 0
+            ? sqrt(static_cast<double>(totalSquares) / totalSamples)
+            : 0.0;
+    Serial.printf("mic summary: samples=%u rms=%.1f peak=%lu\n",
+                  static_cast<unsigned>(totalSamples), totalRms,
+                  static_cast<unsigned long>(totalPeak));
   }
 }
 
@@ -177,6 +260,29 @@ bool setupAudio() {
   return true;
 }
 
+bool setupMicrophoneTest() {
+  if (!audioReady) {
+    return false;
+  }
+
+  micSemaphore = xSemaphoreCreateBinary();
+  if (micSemaphore == nullptr) {
+    Serial.println("mic: failed to create semaphore");
+    return false;
+  }
+
+  const BaseType_t taskResult =
+      xTaskCreate(micTask, "mic", 3072, nullptr, 2, nullptr);
+  if (taskResult != pdPASS) {
+    Serial.printf("mic: failed to start task (%ld)\n",
+                  static_cast<long>(taskResult));
+    return false;
+  }
+
+  Serial.println("microphone test ready; type mic and press Enter");
+  return true;
+}
+
 void queueBeep() {
   if (audioReady) {
     const BaseType_t giveResult = xSemaphoreGive(beepSemaphore);
@@ -184,6 +290,16 @@ void queueBeep() {
                                         : "beep already queued");
   } else {
     Serial.println("audio unavailable");
+  }
+}
+
+void queueMicTest() {
+  if (micReady) {
+    const BaseType_t giveResult = xSemaphoreGive(micSemaphore);
+    Serial.println(giveResult == pdTRUE ? "mic test queued"
+                                        : "mic test already queued");
+  } else {
+    Serial.println("microphone unavailable");
   }
 }
 
@@ -395,6 +511,13 @@ void submitText() {
     return;
   }
 
+  if (strcmp(inputBuffer, "mic") == 0) {
+    queueMicTest();
+    inputLength = 0;
+    inputTruncated = false;
+    return;
+  }
+
   displayText();
 
   Serial.print("displayed ");
@@ -439,6 +562,7 @@ void setup() {
   // Codec I2C traffic is setup-only; the playback task uses only I2S, so it
   // cannot contend with touch reads on the shared Wire bus.
   audioReady = setupAudio();
+  micReady = setupMicrophoneTest();
   setupWiFi();
 }
 
