@@ -12,18 +12,24 @@ offsets come from Waveshare's official `05_gfx_helloworld` Arduino example.
 - Espressif Arduino core 3.2.0 (Waveshare requires 3.2.0 or newer)
 - GFX Library for Arduino 1.6.0
 
-The core and library are pinned in `sketch.yaml`. Arduino CLI downloads them
-into an isolated build-profile cache on the first build, so globally installed
-Arduino libraries do not affect the result. The same profile selects the generic
-ESP32-C6 target, enables USB CDC logging, and configures the board's physical
-16 MB flash with Espressif's 3 MB application / 9.9 MB FATFS partition layout.
+The core and library are pinned in `firmware/sketch.yaml`. Arduino CLI downloads
+them into an isolated build-profile cache on the first build, so globally
+installed Arduino libraries do not affect the result. The same profile selects
+the generic ESP32-C6 target, enables USB CDC logging, and configures the board's
+physical 16 MB flash with Espressif's 3 MB application / 9.9 MB FATFS partition
+layout.
+
+`arduino.ps1` runs the repo-local Arduino CLI and keeps its data, downloads,
+user directory, and build cache under `.arduino-cli`. The firmware lives in a
+separate sketch directory so these toolchain files are not scanned as sketch
+inputs.
 
 ## Build
 
 From this directory:
 
 ```powershell
-arduino-cli compile --profile waveshare_esp32c6 .
+.\arduino.ps1 compile --profile waveshare_esp32c6 .\firmware
 ```
 
 ## Flash
@@ -31,13 +37,13 @@ arduino-cli compile --profile waveshare_esp32c6 .
 Connect the board over USB-C, close any serial monitor using its port, and run:
 
 ```powershell
-arduino-cli upload --profile waveshare_esp32c6 --port COM_PORT .
+.\arduino.ps1 upload --profile waveshare_esp32c6 --port COM_PORT .\firmware
 ```
 
 Replace `COM_PORT` with the port shown by:
 
 ```powershell
-arduino-cli board list
+.\arduino.ps1 board list
 ```
 
 If automatic download mode fails, hold BOOT while resetting or reconnecting the
