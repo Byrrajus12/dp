@@ -1,6 +1,11 @@
 #include <Arduino_GFX_Library.h>
+#include <ESP_I2S.h>
 #include <TouchDrvCSTXXX.hpp>
 #include <Wire.h>
+#include <esp_err.h>
+
+#include "audio_chirp.h"
+#include "es8311.h"
 
 // Display configuration from Waveshare's official 05_gfx_helloworld example
 // for the ESP32-C6-Touch-LCD-1.69 (SKU 31538).
@@ -13,6 +18,14 @@ constexpr int LCD_BL = 6;
 constexpr int I2C_SDA = 8;
 constexpr int I2C_SCL = 7;
 constexpr int TOUCH_IRQ = 11;
+constexpr int I2S_MCLK = 19;
+constexpr int I2S_BCLK = 20;
+constexpr int I2S_WS = 22;
+constexpr int I2S_DOUT = 23;
+constexpr int I2S_DIN = 21;
+constexpr int AUDIO_MCLK_MULTIPLE = 256;
+constexpr int AUDIO_CODEC_VOLUME = 75;
+constexpr size_t AUDIO_CHUNK_SAMPLES = 256;
 
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(
@@ -22,6 +35,9 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     0 /* col offset 2 */, 20 /* row offset 2 */);
 TouchDrvCSTXXX touch;
 volatile bool isPressed = false;
+I2SClass i2s;
+SemaphoreHandle_t beepSemaphore = nullptr;
+bool audioReady = false;
 
 constexpr size_t MAX_TEXT_LENGTH = 256;
 constexpr int TEXT_SIZE = 2;
@@ -35,6 +51,115 @@ constexpr int MAX_CHARS_PER_LINE =
 char inputBuffer[MAX_TEXT_LENGTH + 1];
 size_t inputLength = 0;
 bool inputTruncated = false;
+
+void audioTask(void *arg) {
+  static int16_t tone[AUDIO_CHUNK_SAMPLES];
+  static const int16_t silence[AUDIO_CHUNK_SAMPLES] = {};
+
+  while (true) {
+    xSemaphoreTake(beepSemaphore, portMAX_DELAY);
+
+    for (size_t offset = 0; offset < CHIRP_SAMPLE_COUNT;
+         offset += AUDIO_CHUNK_SAMPLES) {
+      size_t sampleCount =
+          min(AUDIO_CHUNK_SAMPLES, CHIRP_SAMPLE_COUNT - offset);
+      for (size_t i = 0; i < sampleCount; ++i) {
+        tone[i] = TONE_CYCLE[(offset + i) % TONE_CYCLE_SAMPLES];
+      }
+      const size_t bytesRequested = sampleCount * sizeof(tone[0]);
+      const size_t bytesWritten = i2s.write(
+          reinterpret_cast<const uint8_t *>(tone), bytesRequested);
+      if (bytesWritten != bytesRequested) {
+        Serial.printf("audio: I2S.write failed: %u/%u bytes, error=%d\n",
+                      static_cast<unsigned>(bytesWritten),
+                      static_cast<unsigned>(bytesRequested), i2s.lastError());
+        break;
+      }
+    }
+
+    const size_t silenceBytesWritten =
+        i2s.write(reinterpret_cast<const uint8_t *>(silence), sizeof(silence));
+    if (silenceBytesWritten != sizeof(silence)) {
+      Serial.printf("audio: silence write failed: %u/%u bytes, error=%d\n",
+                    static_cast<unsigned>(silenceBytesWritten),
+                    static_cast<unsigned>(sizeof(silence)), i2s.lastError());
+    }
+  }
+}
+
+bool setupAudio() {
+  Wire.beginTransmission(ES8311_ADDRESS_0);
+  const uint8_t probeResult = Wire.endTransmission(true);
+  if (probeResult != 0) {
+    Serial.printf("audio: ES8311 probe 0x%02X failed (Wire error %u)\n",
+                  ES8311_ADDRESS_0, probeResult);
+    return false;
+  }
+
+  es8311_handle_t codec = es8311_create(I2C_NUM_0, ES8311_ADDRESS_0);
+  if (codec == nullptr) {
+    Serial.println("audio: failed to create ES8311 codec");
+    return false;
+  }
+
+  const es8311_clock_config_t clockConfig = {
+      .mclk_inverted = false,
+      .sclk_inverted = false,
+      .mclk_from_mclk_pin = true,
+      .mclk_frequency = CHIRP_SAMPLE_RATE * AUDIO_MCLK_MULTIPLE,
+      .sample_frequency = CHIRP_SAMPLE_RATE,
+  };
+
+  esp_err_t result = es8311_init(codec, &clockConfig, ES8311_RESOLUTION_16,
+                                 ES8311_RESOLUTION_16);
+  if (result != ESP_OK) {
+    Serial.printf("audio: ES8311 init failed: %s (%d)\n",
+                  esp_err_to_name(result), result);
+    es8311_delete(codec);
+    return false;
+  }
+
+  result = es8311_voice_volume_set(codec, AUDIO_CODEC_VOLUME, nullptr);
+  if (result != ESP_OK) {
+    Serial.printf("audio: ES8311 volume failed: %s (%d)\n",
+                  esp_err_to_name(result), result);
+    es8311_delete(codec);
+    return false;
+  }
+
+  result = es8311_microphone_config(codec, false);
+  if (result != ESP_OK) {
+    Serial.printf("audio: ES8311 microphone config failed: %s (%d)\n",
+                  esp_err_to_name(result), result);
+    es8311_delete(codec);
+    return false;
+  }
+
+  i2s.setPins(I2S_BCLK, I2S_WS, I2S_DOUT, I2S_DIN, I2S_MCLK);
+  if (!i2s.begin(I2S_MODE_STD, CHIRP_SAMPLE_RATE,
+                 I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO,
+                 I2S_STD_SLOT_LEFT)) {
+    Serial.printf("audio: I2S init failed, error=%d\n", i2s.lastError());
+    return false;
+  }
+
+  beepSemaphore = xSemaphoreCreateBinary();
+  if (beepSemaphore == nullptr) {
+    Serial.println("audio: failed to create beep semaphore");
+    return false;
+  }
+
+  const BaseType_t taskResult =
+      xTaskCreate(audioTask, "audio", 3072, nullptr, 2, nullptr);
+  if (taskResult != pdPASS) {
+    Serial.printf("audio: failed to start playback task (%ld)\n",
+                  static_cast<long>(taskResult));
+    return false;
+  }
+
+  Serial.println("audio ready; type beep and press Enter");
+  return true;
+}
 
 void displayText() {
   gfx->fillScreen(RGB565_BLACK);
@@ -57,6 +182,20 @@ void displayText() {
 
 void submitText() {
   inputBuffer[inputLength] = '\0';
+
+  if (strcmp(inputBuffer, "beep") == 0) {
+    if (audioReady) {
+      const BaseType_t giveResult = xSemaphoreGive(beepSemaphore);
+      Serial.println(giveResult == pdTRUE ? "beep queued"
+                                          : "beep already queued");
+    } else {
+      Serial.println("audio unavailable");
+    }
+    inputLength = 0;
+    inputTruncated = false;
+    return;
+  }
+
   displayText();
 
   Serial.print("displayed ");
@@ -97,6 +236,10 @@ void setup() {
 
   isPressed = false;
   attachInterrupt(TOUCH_IRQ, []() { isPressed = true; }, FALLING);
+
+  // Codec I2C traffic is setup-only; the playback task uses only I2S, so it
+  // cannot contend with touch reads on the shared Wire bus.
+  audioReady = setupAudio();
 }
 
 void loop() {
