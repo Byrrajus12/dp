@@ -6,3 +6,6 @@
 
 # Optional explicit build output
 build/
+
+# Local Wi-Fi credentials
+firmware/wifi_secrets.h

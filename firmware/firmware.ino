@@ -1,11 +1,13 @@
 #include <Arduino_GFX_Library.h>
 #include <ESP_I2S.h>
 #include <TouchDrvCSTXXX.hpp>
+#include <WiFi.h>
 #include <Wire.h>
 #include <esp_err.h>
 
 #include "audio_chirp.h"
 #include "es8311.h"
+#include "wifi_secrets.h"
 
 // Display configuration from Waveshare's official 05_gfx_helloworld example
 // for the ESP32-C6-Touch-LCD-1.69 (SKU 31538).
@@ -38,6 +40,8 @@ volatile bool isPressed = false;
 I2SClass i2s;
 SemaphoreHandle_t beepSemaphore = nullptr;
 bool audioReady = false;
+bool wifiStarted = false;
+bool wifiConnected = false;
 
 constexpr size_t MAX_TEXT_LENGTH = 256;
 constexpr int TEXT_SIZE = 2;
@@ -161,6 +165,48 @@ bool setupAudio() {
   return true;
 }
 
+void setupWiFi() {
+  if (!WiFi.mode(WIFI_STA)) {
+    Serial.println("wifi: failed to enter station mode");
+    return;
+  }
+
+  Serial.print("wifi mac: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("wifi connecting");
+
+#if PET_WIFI_AUTH_MODE == PET_WIFI_AUTH_PERSONAL
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#elif PET_WIFI_AUTH_MODE == PET_WIFI_AUTH_ENTERPRISE_PEAP
+  WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, WIFI_EAP_IDENTITY,
+             WIFI_EAP_USERNAME, WIFI_PASSWORD, WIFI_EAP_CA_CERT);
+#else
+#error "Unsupported PET_WIFI_AUTH_MODE"
+#endif
+
+  wifiStarted = true;
+}
+
+void updateWiFi() {
+  if (!wifiStarted) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiConnected) {
+      wifiConnected = true;
+      Serial.print("wifi connected: ");
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  if (wifiConnected) {
+    wifiConnected = false;
+    Serial.println("wifi disconnected");
+  }
+}
+
 void displayText() {
   gfx->fillScreen(RGB565_BLACK);
   gfx->setTextColor(RGB565_WHITE);
@@ -240,9 +286,12 @@ void setup() {
   // Codec I2C traffic is setup-only; the playback task uses only I2S, so it
   // cannot contend with touch reads on the shared Wire bus.
   audioReady = setupAudio();
+  setupWiFi();
 }
 
 void loop() {
+  updateWiFi();
+
   while (Serial.available() > 0) {
     char received = static_cast<char>(Serial.read());
 
