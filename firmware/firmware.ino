@@ -3,7 +3,9 @@
 #include <TouchDrvCSTXXX.hpp>
 #include <WiFi.h>
 #include <Wire.h>
+#include <errno.h>
 #include <esp_err.h>
+#include <lwip/sockets.h>
 
 #include "audio_chirp.h"
 #include "es8311.h"
@@ -42,6 +44,16 @@ SemaphoreHandle_t beepSemaphore = nullptr;
 bool audioReady = false;
 bool wifiStarted = false;
 bool wifiConnected = false;
+
+constexpr uint16_t TCP_PORT = 8765;
+constexpr size_t MAX_TCP_MESSAGE_BYTES = 8192;
+constexpr size_t TCP_READ_BUDGET = 1024;
+NetworkServer tcpServer(TCP_PORT, 1);
+NetworkClient tcpClient;
+bool tcpListening = false;
+char tcpInputBuffer[MAX_TCP_MESSAGE_BYTES + 1];
+size_t tcpInputLength = 0;
+bool tcpInputOversized = false;
 
 constexpr size_t MAX_TEXT_LENGTH = 256;
 constexpr int TEXT_SIZE = 2;
@@ -165,6 +177,16 @@ bool setupAudio() {
   return true;
 }
 
+void queueBeep() {
+  if (audioReady) {
+    const BaseType_t giveResult = xSemaphoreGive(beepSemaphore);
+    Serial.println(giveResult == pdTRUE ? "beep queued"
+                                        : "beep already queued");
+  } else {
+    Serial.println("audio unavailable");
+  }
+}
+
 void setupWiFi() {
   if (!WiFi.mode(WIFI_STA)) {
     Serial.println("wifi: failed to enter station mode");
@@ -207,6 +229,143 @@ void updateWiFi() {
   }
 }
 
+void resetTcpInput() {
+  tcpInputLength = 0;
+  tcpInputOversized = false;
+}
+
+bool hasTcpClient() {
+  return tcpClient.fd() >= 0;
+}
+
+bool isTcpPeerConnected() {
+  // NetworkClient may already have bytes in its private receive buffer even
+  // when the socket itself is at EOF. Drain those before acting on FIN.
+  if (tcpClient.available() > 0) {
+    return true;
+  }
+
+  const int socket = tcpClient.fd();
+  if (socket < 0) {
+    return false;
+  }
+
+  uint8_t byte;
+  const int result = recv(socket, &byte, 1, MSG_DONTWAIT | MSG_PEEK);
+  if (result > 0) {
+    return true;
+  }
+  if (result == 0) {
+    return false;
+  }
+
+  return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
+
+void stopTcp() {
+  if (hasTcpClient()) {
+    tcpClient.stop();
+    Serial.println("tcp client disconnected");
+  }
+  tcpServer.end();
+  tcpListening = false;
+  resetTcpInput();
+}
+
+void sendReceivedResponse(const char *receivedType) {
+  tcpClient.print(
+      "{\"type\":\"pet.received\",\"source\":\"desktop-pet\",\"data\":{\"receivedType\":\"");
+  tcpClient.print(receivedType);
+  tcpClient.print("\"}}\n");
+}
+
+void handleTcpLine() {
+  if (tcpInputLength > 0 && tcpInputBuffer[tcpInputLength - 1] == '\r') {
+    --tcpInputLength;
+  }
+  if (tcpInputLength == 0) {
+    return;
+  }
+
+  tcpInputBuffer[tcpInputLength] = '\0';
+
+  // Temporary transport bring-up logic: the line remains opaque UTF-8. These
+  // exact tokens identify messages emitted by the existing bridge; this is not
+  // intended to validate or generally parse JSON.
+  const char *receivedType = "unknown";
+  if (strstr(tcpInputBuffer, "\"type\":\"system.hello\"") != nullptr) {
+    receivedType = "system.hello";
+  } else if (strstr(tcpInputBuffer,
+                    "\"type\":\"approval.requested\"") != nullptr) {
+    receivedType = "approval.requested";
+  }
+
+  Serial.print("event: ");
+  Serial.println(receivedType);
+  sendReceivedResponse(receivedType);
+
+  if (strcmp(receivedType, "approval.requested") == 0) {
+    queueBeep();
+  }
+}
+
+void updateTcp() {
+  if (!wifiConnected) {
+    if (tcpListening || hasTcpClient()) {
+      stopTcp();
+    }
+    return;
+  }
+
+  if (!tcpListening) {
+    tcpServer.begin();
+    if (tcpServer) {
+      tcpServer.setNoDelay(true);
+      tcpListening = true;
+      Serial.printf("tcp listening: %u\n", TCP_PORT);
+    }
+    return;
+  }
+
+  if (!hasTcpClient()) {
+    tcpClient = tcpServer.accept();
+    if (hasTcpClient()) {
+      resetTcpInput();
+      Serial.println("tcp client connected");
+    }
+    return;
+  }
+
+  size_t bytesRead = 0;
+  while (bytesRead < TCP_READ_BUDGET && tcpClient.available() > 0) {
+    const int value = tcpClient.read();
+    if (value < 0) {
+      break;
+    }
+    ++bytesRead;
+
+    if (value == '\n') {
+      if (!tcpInputOversized) {
+        handleTcpLine();
+      }
+      resetTcpInput();
+    } else if (!tcpInputOversized) {
+      if (tcpInputLength < MAX_TCP_MESSAGE_BYTES) {
+        tcpInputBuffer[tcpInputLength++] = static_cast<char>(value);
+      } else {
+        tcpInputOversized = true;
+        Serial.println("tcp line exceeds 8192 bytes; discarded");
+      }
+    }
+  }
+
+  if (!isTcpPeerConnected()) {
+    tcpClient.stop();
+    resetTcpInput();
+    Serial.println("tcp client disconnected");
+  }
+}
+
 void displayText() {
   gfx->fillScreen(RGB565_BLACK);
   gfx->setTextColor(RGB565_WHITE);
@@ -230,13 +389,7 @@ void submitText() {
   inputBuffer[inputLength] = '\0';
 
   if (strcmp(inputBuffer, "beep") == 0) {
-    if (audioReady) {
-      const BaseType_t giveResult = xSemaphoreGive(beepSemaphore);
-      Serial.println(giveResult == pdTRUE ? "beep queued"
-                                          : "beep already queued");
-    } else {
-      Serial.println("audio unavailable");
-    }
+    queueBeep();
     inputLength = 0;
     inputTruncated = false;
     return;
@@ -291,6 +444,7 @@ void setup() {
 
 void loop() {
   updateWiFi();
+  updateTcp();
 
   while (Serial.available() > 0) {
     char received = static_cast<char>(Serial.read());
