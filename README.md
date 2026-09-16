@@ -49,6 +49,41 @@ Replace `COM_PORT` with the port shown by:
 If automatic download mode fails, hold BOOT while resetting or reconnecting the
 board, upload again, then reset the board after the upload finishes.
 
+## Windows bridge
+
+The first PC-side bridge is a dependency-free PowerShell 7 script. It maintains
+one TCP connection to the pet, sends and receives UTF-8 newline-delimited JSON,
+and reconnects with bounded exponential backoff. It intentionally has no
+discovery, TLS, authentication, acknowledgement, or durable queue yet.
+
+Start the local mock pet in one PowerShell window:
+
+```powershell
+.\bridge\MockPet.ps1 -Port 8765
+```
+
+Start the bridge in another:
+
+```powershell
+.\bridge\DesktopPetBridge.ps1 -PetHost 127.0.0.1 -Port 8765
+```
+
+The bridge sends `system.hello` after every connection. In its terminal, enter
+`approval.requested` to send that semantic event, or `quit` to stop. For a
+non-interactive smoke run, `-SendApprovalRequested` queues one approval event
+for the first successful connection.
+
+Messages are limited to 8192 bytes by default on both sides; use
+`-MaxMessageBytes` to select another limit. Run the integration check with:
+
+```powershell
+.\bridge\Test-Bridge.ps1
+```
+
+The check uses a free loopback port, validates traffic in both directions,
+kills and restarts the mock pet, and verifies that the bridge reconnects and
+sends a fresh hello.
+
 ## Sources
 
 - https://www.waveshare.com/wiki/ESP32-C6-Touch-LCD-1.69
