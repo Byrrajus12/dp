@@ -1,4 +1,6 @@
 #include <Arduino_GFX_Library.h>
+#include <TouchDrvCSTXXX.hpp>
+#include <Wire.h>
 
 // Display configuration from Waveshare's official 05_gfx_helloworld example
 // for the ESP32-C6-Touch-LCD-1.69 (SKU 31538).
@@ -8,6 +10,9 @@ constexpr int LCD_CS = 5;
 constexpr int LCD_DC = 3;
 constexpr int LCD_RST = 4;
 constexpr int LCD_BL = 6;
+constexpr int I2C_SDA = 8;
+constexpr int I2C_SCL = 7;
+constexpr int TOUCH_IRQ = 11;
 
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(
@@ -15,6 +20,8 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     240 /* width */, 280 /* height */,
     0 /* col offset 1 */, 20 /* row offset 1 */,
     0 /* col offset 2 */, 20 /* row offset 2 */);
+TouchDrvCSTXXX touch;
+volatile bool isPressed = false;
 
 constexpr size_t MAX_TEXT_LENGTH = 256;
 constexpr int TEXT_SIZE = 2;
@@ -67,6 +74,7 @@ void submitText() {
 }
 
 void setup() {
+  Wire.begin(I2C_SDA, I2C_SCL);
   Serial.begin(115200);
   Serial.println("desktop pet LCD bring-up");
 
@@ -80,11 +88,15 @@ void setup() {
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
 
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setTextSize(3);
-  gfx->setCursor(22, 90);
-  gfx->setCursor(48, 135);
-  gfx->println("hello :)");
+  touch.setPins(-1, TOUCH_IRQ);
+  touch.setTouchDrvModel(TouchDrv_CST8XX);
+  if (!touch.begin(Wire, CST816_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
+    Serial.println("failed to initialize touch");
+    return;
+  }
+
+  isPressed = false;
+  attachInterrupt(TOUCH_IRQ, []() { isPressed = true; }, FALLING);
 }
 
 void loop() {
@@ -101,4 +113,20 @@ void loop() {
       }
     }
   }
+
+  int16_t x[5], y[5];
+  if (isPressed) {
+    isPressed = false;
+    uint8_t touched = touch.getPoint(x, y, touch.getSupportTouchPoint());
+    if (touched && x[0] >= 0 && x[0] < gfx->width() && y[0] >= 0 &&
+        y[0] < gfx->height()) {
+      Serial.print("touch x: ");
+      Serial.print(x[0]);
+      Serial.print(" y: ");
+      Serial.println(y[0]);
+      gfx->drawCircle(x[0], y[0], 2, RGB565_RED);
+    }
+  }
+
+  delay(5);
 }
