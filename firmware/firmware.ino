@@ -1,5 +1,6 @@
 #include <Arduino_GFX_Library.h>
 #include <ESP_I2S.h>
+#include <SensorQMI8658.hpp>
 #include <TouchDrvCSTXXX.hpp>
 #include <WiFi.h>
 #include <Wire.h>
@@ -38,6 +39,8 @@ constexpr size_t MIC_TEST_SAMPLES =
     CHIRP_SAMPLE_RATE * MIC_TEST_DURATION_MS / 1000;
 constexpr size_t MIC_REPORT_SAMPLES =
     CHIRP_SAMPLE_RATE * MIC_REPORT_INTERVAL_MS / 1000;
+constexpr uint32_t IMU_TEST_DURATION_MS = 5000;
+constexpr uint32_t IMU_REPORT_INTERVAL_MS = 125;
 
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_SCK, LCD_DIN);
 Arduino_GFX *gfx = new Arduino_ST7789(
@@ -46,6 +49,7 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     0 /* col offset 1 */, 20 /* row offset 1 */,
     0 /* col offset 2 */, 20 /* row offset 2 */);
 TouchDrvCSTXXX touch;
+SensorQMI8658 qmi;
 volatile bool isPressed = false;
 I2SClass i2s;
 SemaphoreHandle_t beepSemaphore = nullptr;
@@ -54,6 +58,12 @@ bool audioReady = false;
 bool micReady = false;
 bool wifiStarted = false;
 bool wifiConnected = false;
+bool imuReady = false;
+bool imuTestActive = false;
+uint32_t imuTestStartMs = 0;
+uint32_t imuLastReportMs = 0;
+uint32_t imuSampleCount = 0;
+uint32_t imuReadFailureCount = 0;
 
 constexpr uint16_t TCP_PORT = 8765;
 constexpr size_t MAX_TCP_MESSAGE_BYTES = 8192;
@@ -303,6 +313,96 @@ void queueMicTest() {
   }
 }
 
+bool setupImu() {
+  // SensorLib's I2C adapter calls Wire.begin(), but Arduino-ESP32 leaves an
+  // already-active bus intact. Omitting SDA/SCL also avoids setPins() on the
+  // shared bus after touch has initialized it.
+  if (!qmi.begin(Wire, QMI8658_L_SLAVE_ADDRESS)) {
+    Serial.println("imu: QMI8658 not found; continuing without IMU");
+    return false;
+  }
+
+  const uint8_t whoAmI = qmi.whoAmI();
+  const uint8_t revision = qmi.getChipID();
+  Serial.printf("imu found: whoami=0x%02X revision=0x%02X\n", whoAmI,
+                revision);
+
+  // In 6-axis mode the gyroscope selects the effective shared ODR, so these
+  // settings produce about 112 Hz data while retaining useful motion range.
+  if (qmi.configAccelerometer(SensorQMI8658::ACC_RANGE_4G,
+                              SensorQMI8658::ACC_ODR_125Hz,
+                              SensorQMI8658::LPF_MODE_3) != 0 ||
+      qmi.configGyroscope(SensorQMI8658::GYR_RANGE_512DPS,
+                          SensorQMI8658::GYR_ODR_112_1Hz,
+                          SensorQMI8658::LPF_MODE_3) != 0 ||
+      !qmi.enableAccelerometer() || !qmi.enableGyroscope()) {
+    Serial.println("imu: configuration failed; continuing without IMU");
+    return false;
+  }
+
+  Serial.println("imu ready; type imu and press Enter");
+  return true;
+}
+
+void startImuTest() {
+  if (!imuReady) {
+    Serial.println("imu unavailable");
+    return;
+  }
+  if (imuTestActive) {
+    Serial.println("imu test already running");
+    return;
+  }
+
+  imuTestActive = true;
+  imuTestStartMs = millis();
+  imuLastReportMs = imuTestStartMs - IMU_REPORT_INTERVAL_MS;
+  imuSampleCount = 0;
+  imuReadFailureCount = 0;
+  Serial.printf("imu start: duration=%lu ms report_rate=8 Hz\n",
+                static_cast<unsigned long>(IMU_TEST_DURATION_MS));
+}
+
+void updateImuTest() {
+  if (!imuTestActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const uint32_t elapsedMs = now - imuTestStartMs;
+  if (elapsedMs >= IMU_TEST_DURATION_MS) {
+    imuTestActive = false;
+    Serial.printf("imu summary: samples=%lu read_failures=%lu\n",
+                  static_cast<unsigned long>(imuSampleCount),
+                  static_cast<unsigned long>(imuReadFailureCount));
+    return;
+  }
+
+  if (now - imuLastReportMs < IMU_REPORT_INTERVAL_MS ||
+      !qmi.getDataReady()) {
+    return;
+  }
+  imuLastReportMs = now;
+
+  IMUdata accel;
+  IMUdata gyro;
+  const bool accelOk = qmi.getAccelerometer(accel.x, accel.y, accel.z);
+  const bool gyroOk = qmi.getGyroscope(gyro.x, gyro.y, gyro.z);
+  if (!accelOk || !gyroOk) {
+    ++imuReadFailureCount;
+    return;
+  }
+
+  const float accelMagnitude =
+      sqrtf(accel.x * accel.x + accel.y * accel.y + accel.z * accel.z);
+  Serial.printf(
+      "imu %4lu ms: accel_g x=%7.3f y=%7.3f z=%7.3f |a|=%6.3f "
+      "gyro_dps x=%8.2f y=%8.2f z=%8.2f temp_c=%5.1f\n",
+      static_cast<unsigned long>(elapsedMs), accel.x, accel.y, accel.z,
+      accelMagnitude, gyro.x, gyro.y, gyro.z, qmi.getTemperature_C());
+  ++imuSampleCount;
+}
+
 void setupWiFi() {
   if (!WiFi.mode(WIFI_STA)) {
     Serial.println("wifi: failed to enter station mode");
@@ -518,6 +618,13 @@ void submitText() {
     return;
   }
 
+  if (strcmp(inputBuffer, "imu") == 0) {
+    startImuTest();
+    inputLength = 0;
+    inputTruncated = false;
+    return;
+  }
+
   displayText();
 
   Serial.print("displayed ");
@@ -559,6 +666,8 @@ void setup() {
   isPressed = false;
   attachInterrupt(TOUCH_IRQ, []() { isPressed = true; }, FALLING);
 
+  imuReady = setupImu();
+
   // Codec I2C traffic is setup-only; the playback task uses only I2S, so it
   // cannot contend with touch reads on the shared Wire bus.
   audioReady = setupAudio();
@@ -583,6 +692,8 @@ void loop() {
       }
     }
   }
+
+  updateImuTest();
 
   int16_t x[5], y[5];
   if (isPressed) {
